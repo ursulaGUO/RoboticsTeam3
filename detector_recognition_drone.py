@@ -318,87 +318,88 @@ while True:
     if frame is None:
         continue
 
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     annotated_frame = frame.copy()
     detections = []
 
-    # ---- 4.1 Run Human Detection ----
-    person_results = person_model.predict(
-        source=frame,
-        classes=[0],  # person class
-        conf=CONF_THRESHOLD,
-        imgsz=IMG_SIZE,
-        device=device,
-        verbose=False
-    )
-
-    # ---- 4.2 Run Pose Detection ----
+    # ---- 4.1 Run Pose Detection (for both posture & face region) ----
     pose_results = pose_model.predict(
-        source=frame,
+        source=frame_rgb,
         conf=CONF_THRESHOLD,
         imgsz=IMG_SIZE,
         device=device,
         verbose=False
     )
 
-    # Collect all pose keypoints
-    all_keypoints = []
-    for r in pose_results:
-        if r.keypoints is not None:
-            for kp in r.keypoints:
-                kps = kp.data[0].cpu().numpy()
-                all_keypoints.append(kps)
-
-    # ---- 4.3 Process each detected person ----
     num_humans = 0
     num_hand_raising = 0
     poi_detected = False  # “Person of Interest” flag
 
-    for det in person_results[0].boxes:
-        num_humans += 1
-        x1, y1, x2, y2 = map(int, det.xyxy[0])
-        crop = frame[y1:y2, x1:x2]
-        label = "Unknown"
-        posture = "Normal"
+    for r in pose_results:
+        if r.keypoints is None:
+            continue
 
-        # ---- Face recognition using person box ----
-        try:
-            if crop.size != 0:
-                detected = DeepFace.represent(
-                    img_path=crop,
-                    model_name="Facenet512",
-                    enforce_detection=False
-                )
-                if detected:
-                    det_embedding = np.array(detected[0]["embedding"])
-                    sim = cosine_similarity(ref_embedding, det_embedding)
-                    if sim > (1 - THRESHOLD):
-                        label = "Ursula"
-                        poi_detected = True
-        except Exception as e:
-            print(f"DeepFace error: {e}")
+        for kp in r.keypoints:
+            kps = kp.data[0].cpu().numpy()  # shape (17,3)
+            if kps.shape[0] < 11:
+                continue
+            num_humans += 1
 
-        # ---- Posture recognition by matching pose ----
-        matched_pose = None
-        for kps in all_keypoints:
-            if match_pose_to_person((x1, y1, x2, y2), kps):
-                matched_pose = kps
-                break
-        if matched_pose is not None and is_hand_raised(matched_pose):
-            posture = "Hand Raised"
-            num_hand_raising += 1
+            # --- Compute boxes from keypoints ---
+            x_min, y_min = np.min(kps[:, 0]), np.min(kps[:, 1])
+            x_max, y_max = np.max(kps[:, 0]), np.max(kps[:, 1])
+            body_box = [int(x_min), int(y_min), int(x_max), int(y_max)]
 
-        # ---- Draw only the person box ----
-        color = (0, 255, 0) if posture == "Hand Raised" else (0, 0, 255)
-        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated_frame, f"{label} | {posture}",
-                    (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            # Face region from keypoints 0–4 (nose, eyes, ears)
+            fx_min, fy_min = np.min(kps[:5, 0]), np.min(kps[:5, 1])
+            fx_max, fy_max = np.max(kps[:5, 0]), np.max(kps[:5, 1])
 
-        detections.append({
-            "label": label,
-            "posture": posture,
-            "box": [x1, y1, x2, y2]
-        })
+            # Slightly expand face box
+            fw = fx_max - fx_min
+            fh = fy_max - fy_min
+            fx1 = int(max(fx_min - 0.3 * fw, 0))
+            fy1 = int(max(fy_min - 0.6 * fh, 0))
+            fx2 = int(min(fx_max + 0.3 * fw, frame.shape[1]))
+            fy2 = int(min(fy_max + 0.8 * fh, frame.shape[0]))
+
+            face_crop = frame_rgb[fy1:fy2, fx1:fx2]
+            label = "Unknown"
+            posture = "Normal"
+
+            # ---- Face recognition using face box only ----
+            try:
+                if face_crop.size != 0:
+                    detected = DeepFace.represent(
+                        img_path=face_crop,
+                        model_name="Facenet512",
+                        enforce_detection=False
+                    )
+                    if detected:
+                        det_embedding = np.array(detected[0]["embedding"])
+                        sim = cosine_similarity(ref_embedding, det_embedding)
+                        if sim > (1 - THRESHOLD):
+                            label = "Ursula"
+                            poi_detected = True
+            except Exception as e:
+                print(f"DeepFace error: {e}")
+
+            # ---- Posture recognition ----
+            if is_hand_raised(kps):
+                posture = "Hand Raised"
+                num_hand_raising += 1
+
+            # ---- Draw only the face box ----
+            color = (0, 255, 0) if posture == "Hand Raised" else (0, 0, 255)
+            cv2.rectangle(annotated_frame, (fx1, fy1), (fx2, fy2), color, 2)
+            cv2.putText(annotated_frame, f"{label} | {posture}",
+                        (fx1, max(fy1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            detections.append({
+                "label": label,
+                "posture": posture,
+                "face_box": [fx1, fy1, fx2, fy2],
+                "body_box": body_box
+            })
 
     # ---- Overlay info ----
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -407,10 +408,7 @@ while True:
     info_text3 = f"Detected POI: {poi_detected}"
     info_text4 = f"Number of Hand Raising: {num_hand_raising}"
 
-    # Draw background rectangle for UI
     cv2.rectangle(annotated_frame, (0, 0), (annotated_frame.shape[1], 100), (0, 0, 0), -1)
-
-    # Display all info lines
     cv2.putText(annotated_frame, info_text1, (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
     cv2.putText(annotated_frame, info_text2, (10, 50),
@@ -436,6 +434,7 @@ while True:
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
+
 
 # ======================
 # 5. Cleanup
